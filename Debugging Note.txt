@@ -1,5 +1,4 @@
-Improving the GUI
-Reduce the Pause n Unpause thing to Play
-Add loop and repeat
-Continuing the music
-
+Update the player info to the bottom.
+Add a global player queue on left or right window.
+Create a tab for music selection aka, local & spotify
+Can play with mix e.g spotify then local then spotify. 

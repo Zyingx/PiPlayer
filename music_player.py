@@ -6,7 +6,30 @@ import tkinter.messagebox
 import os, random, time, threading
 import pygame
 from mutagen import File as MutagenFile
+from mutagen.mp3 import MP3
+from mutagen.id3 import ID3
 import spotify_tab
+import ctypes
+import io
+
+try:
+    from PIL import Image, ImageTk, ImageDraw
+    PIL_AVAILABLE = True
+except ImportError:
+    PIL_AVAILABLE = False
+    print("[WARN] Pillow not installed. Album art disabled. Run: pip install Pillow")
+
+def set_dark_titlebar(window):
+    try:
+        window.update()
+        DWMWA_USE_IMMERSIVE_DARK_MODE = 20
+        set_window_attribute = ctypes.windll.dwmapi.DwmSetWindowAttribute
+        get_parent = ctypes.windll.user32.GetParent
+        hwnd = get_parent(window.winfo_id())
+        rendering_policy = ctypes.c_int(2)
+        set_window_attribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, ctypes.byref(rendering_policy), ctypes.sizeof(rendering_policy))
+    except Exception:
+        pass
 
 pygame.mixer.init(frequency=44100, size=-16, channels=2, buffer=2048)
 
@@ -15,22 +38,25 @@ MUSIC_DIR = os.path.join(BASE_DIR, "Music")
 ICON_PATH = os.path.join(BASE_DIR, "Logo & Stuff", "PiPlayer.ico")
 
 # ── Colors ────────────────────────────────────────────────────────
-BG      = "#08080e"
-BG2     = "#0e0e1a"
-BG3     = "#131326"
-BG4     = "#1a1a36"
-BG5     = "#161630"
-GRN     = "#1DB954"
-GRN2    = "#1ed760"
-GRN_BG  = "#0d2e1a"
+BG      = "#000000"
+BG2     = "#050508"
+BG3     = "#0a0a0f"
+BG4     = "#111118"
+BG5     = "#0d0d14"
+GRN     = "#3b82f6"
+GRN2    = "#60a5fa"
+GRN_BG  = "#0c1a2e"
 PRP     = "#7c5cfc"
 TX1     = "#f0f0f5"
 TX2     = "#9090a8"
 TX3     = "#505068"
-BRD     = "#1e1e3a"
-BRD2    = "#2a2a50"
-PGB     = "#1a1a30"
+BRD     = "#1a1a2a"
+BRD2    = "#222238"
+PGB     = "#12121e"
 RED     = "#ff4757"
+GRAY    = "#a6a6a6"
+
+player_icons = {}
 
 # ── Fonts ─────────────────────────────────────────────────────────
 FH = ("Segoe UI", 10, "bold")
@@ -61,12 +87,228 @@ class State:
         self.elapsed = 0
         self._t0 = 0
         self._off = 0
+        self._vol_timer = None  # debounce timer for Spotify volume
 
 st = State()
 
 # ═══════════════════════════════════════════════════════════════════
 #  HELPERS
 # ═══════════════════════════════════════════════════════════════════
+
+# ── Scrolling Label (marquee effect for long text) ────────────────
+
+class ScrollSync:
+    """Synchronises multiple ScrollingLabels so they scroll together.
+    All labels reach their right end before *any* label reverses, and
+    vice-versa.  Labels that fit their container simply stay centred."""
+
+    SCROLL_SPEED = 1        # pixels per tick
+    TICK_MS      = 30       # ms between ticks
+    PAUSE_MS     = 3000     # 3-second pause at each end
+
+    def __init__(self, root_widget):
+        self._root = root_widget
+        self._labels = []       # list of ScrollingLabel
+        self._direction = 1     # 1 → scrolling left, -1 → scrolling right
+        self._running = False
+        self._after_id = None
+
+    def register(self, label):
+        self._labels.append(label)
+
+    # Called whenever any child label changes text / resizes
+    def restart(self):
+        if self._after_id:
+            self._root.after_cancel(self._after_id)
+            self._after_id = None
+        self._running = False
+        self._direction = 1
+        for lb in self._labels:
+            lb._offset = 0
+            lb._place_text()
+        # Give layout a moment to settle, then decide if we need to scroll
+        self._after_id = self._root.after(500, self._check)
+
+    def _check(self):
+        need_scroll = any(lb._needs_scroll() for lb in self._labels)
+        if need_scroll:
+            self._running = True
+            # Initial pause at the left edge
+            self._after_id = self._root.after(self.PAUSE_MS, self._tick)
+        else:
+            self._running = False
+
+    def _tick(self):
+        if not self._running:
+            return
+
+        # Check if any label still needs to scroll in the current direction
+        any_moving = False
+        all_at_end = True
+
+        for lb in self._labels:
+            max_off = lb._max_offset()
+            if max_off <= 0:
+                continue  # fits — nothing to do
+            # Move one step
+            lb._offset += self.SCROLL_SPEED * self._direction
+            # Clamp
+            if lb._offset >= max_off:
+                lb._offset = max_off
+            elif lb._offset <= 0:
+                lb._offset = 0
+
+            # Has this label reached its end?
+            if self._direction == 1 and lb._offset < max_off:
+                all_at_end = False
+            elif self._direction == -1 and lb._offset > 0:
+                all_at_end = False
+            any_moving = True
+            lb._place_text()
+
+        if not any_moving:
+            # Nothing overflows any more (e.g. window resized)
+            self._running = False
+            for lb in self._labels:
+                lb._offset = 0
+                lb._place_text()
+            return
+
+        if all_at_end:
+            # Every scrolling label has reached the end → reverse + pause
+            self._direction *= -1
+            self._after_id = self._root.after(self.PAUSE_MS, self._tick)
+        else:
+            self._after_id = self._root.after(self.TICK_MS, self._tick)
+
+
+class ScrollingLabel:
+    """A canvas-based label that auto-scrolls when text overflows.
+    Text is centred when it fits; scrolling is driven by a ScrollSync."""
+
+    def __init__(self, parent, text="", font=None, bg="#0e0e1a", fg="#f0f0f5",
+                 height=22, sync=None):
+        self._font = font or ("Segoe UI", 13, "bold")
+        self._fg = fg
+        self._bg = bg
+        self._text = text
+        self._height = height
+        self._sync = sync  # optional ScrollSync
+
+        self.canvas = tki.Canvas(parent, bg=bg, highlightthickness=0, bd=0,
+                                 height=height)
+        self._text_id = self.canvas.create_text(
+            0, height // 2, text=text, font=self._font, fill=fg, anchor="w")
+
+        self._offset = 0
+
+        self.canvas.bind("<Configure>", lambda e: self._on_resize())
+
+        if sync:
+            sync.register(self)
+
+    def pack(self, **kw):
+        self.canvas.pack(**kw)
+
+    def grid(self, **kw):
+        self.canvas.grid(**kw)
+
+    def config(self, **kw):
+        changed = False
+        if "text" in kw:
+            new_text = kw.pop("text")
+            if new_text != self._text:
+                self._text = new_text
+                self.canvas.itemconfig(self._text_id, text=new_text)
+                changed = True
+        if "fg" in kw:
+            self._fg = kw["fg"]
+            self.canvas.itemconfig(self._text_id, fill=self._fg)
+        if "font" in kw:
+            self._font = kw["font"]
+            self.canvas.itemconfig(self._text_id, font=self._font)
+            changed = True
+        if "bg" in kw:
+            self._bg = kw["bg"]
+            self.canvas.config(bg=self._bg)
+        if changed:
+            if self._sync:
+                self._sync.restart()
+            else:
+                self._offset = 0
+                self._place_text()
+
+    # ── internal helpers ──────────────────────────────────────────
+    def _text_width(self):
+        bbox = self.canvas.bbox(self._text_id)
+        return (bbox[2] - bbox[0]) if bbox else 0
+
+    def _canvas_width(self):
+        return self.canvas.winfo_width()
+
+    def _max_offset(self):
+        return max(0, self._text_width() - self._canvas_width())
+
+    def _needs_scroll(self):
+        cw = self._canvas_width()
+        return cw > 0 and self._text_width() > cw
+
+    def _place_text(self):
+        """Position the text item based on current offset.
+        Left-align the text when it fits; scroll when overflowing."""
+        h = self.canvas.winfo_height() or self._height
+        cw = self._canvas_width()
+        tw = self._text_width()
+        if tw <= cw and cw > 0:
+            # Text fits — left-align it
+            self.canvas.coords(self._text_id, 0, h // 2)
+        else:
+            self.canvas.coords(self._text_id, -self._offset, h // 2)
+
+    def _on_resize(self):
+        if self._sync:
+            self._sync.restart()
+        else:
+            self._offset = 0
+            self._place_text()
+
+
+# Global scroll synchroniser (created once, wired to root later)
+_np_sync = None  # initialised after root is created
+
+
+class ModernScrollbar(tki.Canvas):
+    def __init__(self, parent, bg=BG3, fg=TX3, active_fg=TX1, width=8, borderwidth=0):
+        super().__init__(parent, bg=bg, width=width, highlightthickness=0, bd=0)
+        self.command = None
+        self.fg = fg
+        self.active_fg = active_fg
+        self.slider = self.create_rectangle(0, 0, width, 0, fill=fg, outline="", width=0)
+        
+        self.bind("<B1-Motion>", self.on_drag)
+        self.bind("<Button-1>", self.on_click)
+        self.bind("<Enter>", lambda e: self.itemconfig(self.slider, fill=self.active_fg))
+        self.bind("<Leave>", lambda e: self.itemconfig(self.slider, fill=self.fg))
+        
+    def set(self, low, high):
+        h = self.winfo_height()
+        pad = 2
+        y1 = max(pad, float(low) * h)
+        y2 = min(h - pad, float(high) * h)
+        if y2 - y1 < 10:
+            y2 = y1 + 10
+        self.coords(self.slider, pad, y1, self.winfo_width() - pad, y2)
+        
+    def on_drag(self, event):
+        h = self.winfo_height()
+        if h == 0: return
+        fraction = event.y / h
+        if self.command:
+            try: self.command("moveto", fraction)
+            except: pass
+            
+    def on_click(self, event):
+        self.on_drag(event)
 
 def fmt_time(s):
     if s <= 0: return "0:00"
@@ -98,6 +340,69 @@ def hover(w, nb, hb, nf=TX1, hf=None):
     w.bind("<Enter>", lambda e: w.configure(bg=hb, fg=hf))
     w.bind("<Leave>", lambda e: w.configure(bg=nb, fg=nf))
 
+# ── Album Art Helpers ─────────────────────────────────────────────
+ART_SIZE = 58  # thumbnail size in pixels
+
+def _get_local_album_art(filepath):
+    """Extract embedded album art from a local audio file. Returns PIL Image or None."""
+    if not PIL_AVAILABLE:
+        return None
+    try:
+        audio = MutagenFile(filepath)
+        if audio is None:
+            return None
+        # MP3 (ID3 tags)
+        if hasattr(audio, 'tags') and audio.tags:
+            for key in audio.tags:
+                if key.startswith('APIC') or key == 'APIC:':
+                    data = audio.tags[key].data
+                    return Image.open(io.BytesIO(data))
+        # FLAC
+        if hasattr(audio, 'pictures') and audio.pictures:
+            return Image.open(io.BytesIO(audio.pictures[0].data))
+        # MP4/M4A
+        if hasattr(audio, 'tags') and audio.tags:
+            for key in ['covr', 'cover']:
+                if key in audio.tags:
+                    return Image.open(io.BytesIO(bytes(audio.tags[key][0])))
+    except Exception as e:
+        print(f"[DEBUG] Album art extract error: {e}")
+    return None
+
+def _get_spotify_album_art(track_data):
+    """Download album art from Spotify track data. Returns PIL Image or None."""
+    if not PIL_AVAILABLE:
+        return None
+    try:
+        images = track_data.get('album', {}).get('images', [])
+        if not images:
+            return None
+        # Pick smallest image >= ART_SIZE, or the last one
+        url = images[-1]['url']  # smallest
+        for img in images:
+            if img.get('height', 0) >= ART_SIZE and img.get('height', 0) <= 300:
+                url = img['url']
+                break
+        import urllib.request
+        with urllib.request.urlopen(url, timeout=5) as resp:
+            return Image.open(io.BytesIO(resp.read()))
+    except Exception as e:
+        print(f"[DEBUG] Spotify album art error: {e}")
+    return None
+
+def _make_rounded_thumb(pil_img, size=ART_SIZE, radius=8):
+    """Resize and round-corner an image for display."""
+    img = pil_img.resize((size, size), Image.LANCZOS)
+    # Create rounded mask
+    mask = Image.new('L', (size, size), 0)
+    draw = ImageDraw.Draw(mask)
+    draw.rounded_rectangle([0, 0, size, size], radius=radius, fill=255)
+    # Apply mask
+    output = Image.new('RGBA', (size, size), (0, 0, 0, 0))
+    img = img.convert('RGBA')
+    output.paste(img, (0, 0), mask)
+    return output
+
 # ═══════════════════════════════════════════════════════════════════
 #  QUEUE MANAGEMENT
 # ═══════════════════════════════════════════════════════════════════
@@ -111,7 +416,7 @@ def add_local_to_queue(index):
         parts = name.split(" - ", 1)
         artist, title = parts[0].strip(), parts[1].strip()
     else:
-        title, artist = name, "Local"
+        title, artist = name, "Unknown Artist"
     st.queue.append({"source": "local", "title": title, "artist": artist, "file": fp})
     render_queue()
 
@@ -140,11 +445,39 @@ def clear_queue():
 #  PLAYBACK ENGINE
 # ═══════════════════════════════════════════════════════════════════
 
+def _get_current_source():
+    """Return the source of the currently playing track, or None."""
+    if st.qi >= 0 and st.qi < len(st.queue):
+        return st.queue[st.qi]["source"]
+    return None
+
+def _stop_spotify():
+    """Pause Spotify playback if active."""
+    try:
+        if spotify_tab.sp:
+            spotify_tab.sp.pause_playback()
+    except Exception as e:
+        print(f"[DEBUG] Stop Spotify: {e}")
+
+def _stop_local():
+    """Stop pygame local playback."""
+    try:
+        pygame.mixer.music.stop()
+    except:
+        pass
+
 def play_from_queue(idx):
     """Play item at queue index."""
     if idx < 0 or idx >= len(st.queue): return
+    prev_source = _get_current_source()
     st.qi = idx
     item = st.queue[idx]
+
+    # Stop the OTHER engine before switching
+    if item["source"] == "local" and prev_source == "spotify":
+        _stop_spotify()
+    elif item["source"] == "spotify" and prev_source == "local":
+        _stop_local()
 
     if item["source"] == "local":
         _play_local(item)
@@ -162,6 +495,7 @@ def play_from_queue(idx):
             return
     render_queue()
     update_now_playing_ui()
+    _update_btn()
 
 def _play_local(item):
     try:
@@ -205,13 +539,26 @@ def toggle_play():
     if st.qi == -1:
         if st.queue: play_from_queue(0)
         return
+    cur_src = _get_current_source()
     if st.paused:
-        pygame.mixer.music.unpause()
+        if cur_src == "local":
+            pygame.mixer.music.unpause()
+        elif cur_src == "spotify":
+            try:
+                if spotify_tab.sp: spotify_tab.sp.start_playback()
+            except Exception as e:
+                print(f"[DEBUG] Resume Spotify: {e}")
         st.paused = False; st.playing = True
         st._t0 = time.time()
         _start_tick()
     elif st.playing:
-        pygame.mixer.music.pause()
+        if cur_src == "local":
+            pygame.mixer.music.pause()
+        elif cur_src == "spotify":
+            try:
+                if spotify_tab.sp: spotify_tab.sp.pause_playback()
+            except Exception as e:
+                print(f"[DEBUG] Pause Spotify: {e}")
         st.paused = True; st.playing = False
         st._off = st.elapsed
     else:
@@ -219,7 +566,8 @@ def toggle_play():
     _update_btn()
 
 def stop_playback():
-    pygame.mixer.music.stop()
+    _stop_local()
+    _stop_spotify()
     st.playing = False; st.paused = False
     st.elapsed = 0; st._off = 0
     _update_btn()
@@ -251,13 +599,27 @@ def toggle_shuffle():
 
 def toggle_repeat():
     st.repeat = (st.repeat + 1) % 3
-    syms = ["🔁", "🔁", "🔂"]
+    syms = ["\uE8EE", "\uE8EE", "\uE8ED"]
     cols = [TX3, GRN, PRP]
     rep_btn.config(text=syms[st.repeat], fg=cols[st.repeat])
 
 def set_vol(v):
     st.volume = float(v) / 100
     pygame.mixer.music.set_volume(st.volume)
+    # Debounced Spotify volume (avoid 429 rate limit)
+    if _get_current_source() == "spotify" and spotify_tab.sp:
+        if st._vol_timer is not None:
+            root.after_cancel(st._vol_timer)
+        vol_int = int(float(v))
+        def _send_vol():
+            st._vol_timer = None
+            def _sv():
+                try:
+                    spotify_tab.sp.volume(vol_int)
+                except Exception as e:
+                    print(f"[DEBUG] Spotify volume: {e}")
+            threading.Thread(target=_sv, daemon=True).start()
+        st._vol_timer = root.after(500, _send_vol)
     v_pct.config(text=f"{int(float(v))}%")
     if st.volume == 0: v_icon.config(text="🔇")
     elif st.volume < 0.4: v_icon.config(text="🔉")
@@ -275,13 +637,23 @@ def seek(ev):
     if st.duration <= 0 or not st.playing: return
     pct = max(0, min(1, ev.x / prog_bar.winfo_width()))
     pos = pct * st.duration
-    if st.qi >= 0 and st.queue[st.qi]["source"] == "local":
+    cur_src = _get_current_source()
+    if cur_src == "local" and st.qi >= 0:
         try:
             pygame.mixer.music.load(st.queue[st.qi]["file"])
             pygame.mixer.music.play(start=pos)
             pygame.mixer.music.set_volume(st.volume)
             st._t0 = time.time(); st._off = pos; st.elapsed = pos
         except: pass
+    elif cur_src == "spotify" and spotify_tab.sp:
+        pos_ms = int(pos * 1000)
+        st._t0 = time.time(); st._off = pos; st.elapsed = pos
+        def _sk():
+            try:
+                spotify_tab.sp.seek_track(pos_ms)
+            except Exception as e:
+                print(f"[DEBUG] Spotify seek: {e}")
+        threading.Thread(target=_sk, daemon=True).start()
 
 # ── Progress tick ─────────────────────────────────────────────────
 def _start_tick():
@@ -291,7 +663,20 @@ def _start_tick():
             _draw_progress(st.elapsed, st.duration)
             lbl_cur.config(text=fmt_time(st.elapsed))
             lbl_tot.config(text=fmt_time(st.duration))
-            if not pygame.mixer.music.get_busy() and st.playing:
+
+            cur_src = _get_current_source()
+            track_ended = False
+
+            if cur_src == "local":
+                # Local: check pygame
+                if not pygame.mixer.music.get_busy():
+                    track_ended = True
+            elif cur_src == "spotify":
+                # Spotify: check elapsed vs duration
+                if st.duration > 0 and st.elapsed >= st.duration - 0.5:
+                    track_ended = True
+
+            if track_ended and st.playing:
                 st.playing = False
                 play_next()
                 return
@@ -300,7 +685,7 @@ def _start_tick():
     tick()
 
 def _update_btn():
-    play_btn.config(text="⏸" if st.playing else "▶")
+    play_btn.config(text="\uE769" if st.playing else "\uE768")
 
 # ═══════════════════════════════════════════════════════════════════
 #  UI UPDATE
@@ -311,12 +696,43 @@ def update_now_playing_ui():
         np_title.config(text="No track selected")
         np_artist.config(text="PiPlayer")
         lbl_cur.config(text="0:00"); lbl_tot.config(text="0:00")
+        time_row.pack_forget()
+        # Reset album art to default icon
+        np_art_label.config(image='', text="🎧", font=("Segoe UI", 24), fg=TX3, width=4)
+        st._album_art_ref = None
         return
     item = st.queue[st.qi]
-    src_icon = "🎵" if item["source"] == "local" else "🎧"
-    np_title.config(text=f"{src_icon}  {item['title']}")
+    np_title.config(text=item['title'])
     np_artist.config(text=item["artist"])
     lbl_tot.config(text=fmt_time(st.duration))
+    time_row.pack(fill="x", pady=(2, 0))
+
+    # Load album art in background
+    def _load_art():
+        pil_img = None
+        if item["source"] == "local":
+            pil_img = _get_local_album_art(item.get("file", ""))
+        elif item["source"] == "spotify":
+            pil_img = _get_spotify_album_art(item.get("track_data", {}))
+
+        def _apply():
+            if pil_img and PIL_AVAILABLE:
+                thumb = _make_rounded_thumb(pil_img)
+                tk_img = ImageTk.PhotoImage(thumb)
+                np_art_label.config(image=tk_img, text='', width=ART_SIZE)
+                st._album_art_ref = tk_img  # prevent GC
+            else:
+                # Fallback icon
+                icon = "🎵" if item["source"] == "local" else "🎧"
+                np_art_label.config(image='', text=icon, font=("Segoe UI", 24), fg=TX3, width=4)
+                st._album_art_ref = None
+        root.after(0, _apply)
+
+    if PIL_AVAILABLE:
+        threading.Thread(target=_load_art, daemon=True).start()
+    else:
+        icon = "🎵" if item["source"] == "local" else "🎧"
+        np_art_label.config(image='', text=icon, font=("Segoe UI", 24), fg=TX3, width=4)
 
 def _draw_progress(cur, tot):
     prog_bar.delete("all")
@@ -332,14 +748,96 @@ def _draw_progress(cur, tot):
                 prog_bar.create_oval(fw-5, cy-5, fw+5, cy+5, fill=GRN2, outline="")
 
 def render_queue():
-    q_list.delete(0, tki.END)
+    if 'q_frame' not in globals(): return
+    for widget in q_frame.winfo_children():
+        widget.destroy()
     for i, item in enumerate(st.queue):
-        icon = "🎵" if item["source"] == "local" else "🎧"
-        prefix = " ▶ " if i == st.qi else f" {i+1}. "
-        q_list.insert(tki.END, f"{prefix}{icon} {item['title']}  —  {item['artist']}")
+        row = tki.Frame(q_frame, bg=BG3)
+        row.pack(fill="x", pady=2, padx=2)
+        
         if i == st.qi:
-            q_list.itemconfig(i, fg=GRN)
-    q_count.config(text=f"{len(st.queue)}")
+            num_lbl = tki.Label(row, text="▶", font=("Segoe UI", 10), fg=GRN, bg=BG3, width=2, anchor="center")
+        else:
+            num_lbl = tki.Label(row, text=str(i + 1), font=("Segoe UI", 10), fg=TX2, bg=BG3, width=2, anchor="center")
+        num_lbl.pack(side="left", padx=(4, 0))
+        
+        art_lbl = tki.Label(row, bg=BG3, width=4)
+        art_lbl.pack(side="left", padx=(2, 8), pady=4)
+
+        x_btn = tki.Label(row, text="✕", font=("Segoe UI", 12), bg=BG3, fg=TX3, cursor="hand2")
+        x_btn.pack(side="right", padx=8)
+        
+        text_f = tki.Frame(row, bg=BG3)
+        text_f.pack(side="left", fill="both", expand=True)
+        
+        fn_to_use = ("Segoe UI", 10, "bold") if i == st.qi else ("Segoe UI", 10)
+        col_to_use = GRN if i == st.qi else TX1
+        title_lbl = tki.Label(text_f, text=item['title'], font=fn_to_use, fg=col_to_use, bg=BG3, anchor="w")
+        title_lbl.pack(fill="x", anchor="w")
+        
+        artist_lbl = tki.Label(text_f, text=item['artist'], font=FS, fg=TX3, bg=BG3, anchor="w")
+        artist_lbl.pack(fill="x", anchor="w")
+        
+        def _set_hover(state):
+            bg_col = BG4 if state else BG3
+            for w in (row, num_lbl, art_lbl, x_btn, text_f, title_lbl, artist_lbl):
+                try: w.config(bg=bg_col)
+                except: pass
+                
+        def on_enter(e):
+             _set_hover(True)
+        def on_leave(e):
+             _set_hover(False)
+        
+        # Bind enter/leave to the row and ALL children
+        for w in (row, num_lbl, art_lbl, text_f, title_lbl, artist_lbl, x_btn):
+            w.bind("<Enter>", on_enter, add="+")
+            w.bind("<Leave>", on_leave, add="+")
+            
+        def on_x_enter(e):
+            try: x_btn.config(fg=RED)
+            except: pass
+        def on_x_leave(e):
+            try: x_btn.config(fg=TX3)
+            except: pass
+            
+        x_btn.bind("<Enter>", on_x_enter)
+        x_btn.bind("<Leave>", on_x_leave)
+        x_btn.bind("<Button-1>", lambda e, idx=i: remove_from_queue(idx))
+        
+        def make_player(idx):
+            def _play_toggle(e):
+                if idx == st.qi:
+                    toggle_play()
+                else:
+                    play_from_queue(idx)
+            return _play_toggle
+            
+        for w in (row, num_lbl, art_lbl, text_f, title_lbl, artist_lbl):
+            w.bind("<Double-Button-1>", make_player(i))
+            
+        icon = "🎵" if item["source"] == "local" else "🎧"
+        if 'q_img' in item:
+            art_lbl.config(image=item['q_img'], text="", width=40, height=40)
+        else:
+            art_lbl.config(text=icon, font=("Segoe UI", 16), fg=TX3, width=3, height=1)
+            def _load_art(it=item, lbl=art_lbl):
+                pil_img = None
+                if it["source"] == "local":
+                    pil_img = _get_local_album_art(it.get("file", ""))
+                elif it["source"] == "spotify":
+                    pil_img = _get_spotify_album_art(it.get("track_data", {}))
+                
+                def _apply():
+                    if pil_img and PIL_AVAILABLE:
+                        thumb = _make_rounded_thumb(pil_img, size=40)
+                        tk_img = ImageTk.PhotoImage(thumb)
+                        it['q_img'] = tk_img
+                        try: lbl.config(image=tk_img, text="", width=40, height=40)
+                        except: pass
+                if pil_img: root.after(0, _apply)
+            if PIL_AVAILABLE:
+                threading.Thread(target=_load_art, daemon=True).start()
 
 def load_local_tracks():
     st.local_files = scan_music()
@@ -353,6 +851,7 @@ def load_local_tracks():
 #  WINDOW
 # ═══════════════════════════════════════════════════════════════════
 root = tki.Tk()
+set_dark_titlebar(root)
 root.title("PiPlayer v3.0")
 try: root.iconbitmap(ICON_PATH)
 except: pass
@@ -361,18 +860,25 @@ root.minsize(800, 500)
 root.configure(bg=BG)
 root.option_add("*Font", ("Segoe UI", 10))
 
+# Initialise the scroll synchroniser now that root exists
+_np_sync = ScrollSync(root)
+
+# Custom menu bar frame at absolute top
+custom_menubar = tki.Frame(root, bg="#212121", height=24)
+custom_menubar.pack(side="top", fill="x")
+
 # ── Status bar (pack first = always at bottom) ───────────────────
 status = tki.Frame(root, bg=BG4, height=22)
 status.pack(side="bottom", fill="x")
 status.pack_propagate(False)
-tki.Label(status, text="  PiPlayer v3.0  ·  Local + Spotify",
+tki.Label(status, text="  PiPlayer v0.0.1",
     font=FT, bg=BG4, fg=TX3).pack(side="left", padx=6)
-tki.Label(status, text="♫ Ready  ", font=FT, bg=BG4, fg=TX3).pack(side="right", padx=6)
+tki.Label(status, text="Ready  ", font=FT, bg=BG4, fg=TX3).pack(side="right", padx=6)
 
 # ═══════════════════════════════════════════════════════════════════
 #  BOTTOM PLAYER BAR
 # ═══════════════════════════════════════════════════════════════════
-btm = tki.Frame(root, bg=BG2, height=90)
+btm = tki.Frame(root, bg=BG2, height=100)
 btm.pack(side="bottom", fill="x")
 btm.pack_propagate(False)
 
@@ -385,18 +891,39 @@ prog_bar.bind("<Button-1>", seek)
 btm_inner = tki.Frame(btm, bg=BG2, padx=16)
 btm_inner.pack(fill="both", expand=True)
 
-# Left: track info
-info_frame = tki.Frame(btm_inner, bg=BG2, width=260)
+# Left: track info (album art + text)
+info_frame = tki.Frame(btm_inner, bg=BG2, width=300)
 info_frame.pack(side="left", fill="y", pady=8)
 info_frame.pack_propagate(False)
 
-np_title = tki.Label(info_frame, text="No track selected",
-    font=FN, bg=BG2, fg=TX1, anchor="w")
-np_title.pack(fill="x")
+# Album art label
+np_art_label = tki.Label(info_frame, bg=BG2, text="", font=("Segoe UI", 24),
+    fg=TX3, width=4, anchor="center")
+np_art_label.pack(side="left", padx=(0, 12), pady=4)
+st._album_art_ref = None  # keep reference to prevent GC
 
-np_artist = tki.Label(info_frame, text="PiPlayer",
-    font=FA, bg=BG2, fg=GRN, anchor="w")
-np_artist.pack(fill="x", pady=(2, 0))
+# Text info (right of art)
+np_text_frame = tki.Frame(info_frame, bg=BG2)
+np_text_frame.pack(side="left", fill="both", expand=True)
+
+np_title = ScrollingLabel(np_text_frame, text="",
+    font=FN, bg=BG2, fg=TX1, height=22, sync=_np_sync)
+np_title.pack(fill="x", pady=(6, 0))
+
+np_artist = ScrollingLabel(np_text_frame, text="",
+    font=FA, bg=BG2, fg=GRN, height=18, sync=_np_sync)
+np_artist.pack(fill="x")
+
+# Time labels (below artist)
+time_row = tki.Frame(np_text_frame, bg=BG2)
+time_row.pack(fill="x", pady=(2, 0))
+lbl_cur = tki.Label(time_row, text="0:00", font=FTM, bg=BG2, fg=TX2, anchor="w")
+
+lbl_cur.pack(side="left")
+tki.Label(time_row, text=" / ", font=FT, bg=BG2, fg=TX3).pack(side="left")
+lbl_tot = tki.Label(time_row, text="0:00", font=FTM, bg=BG2, fg=TX3, anchor="w")
+lbl_tot.pack(side="left")
+time_row.pack_forget()  # hidden until a track is selected
 
 # Center: controls
 ctrl_frame = tki.Frame(btm_inner, bg=BG2)
@@ -405,54 +932,233 @@ ctrl_frame.pack(side="left", expand=True, pady=8)
 ctrl_row = tki.Frame(ctrl_frame, bg=BG2)
 ctrl_row.pack()
 
-def mkbtn(par, txt, cmd, sz=14, fg=TX1, w=2):
-    b = tki.Button(par, text=txt, command=cmd, bg=BG4, fg=fg,
-        font=("Segoe UI", sz), relief=tki.FLAT, cursor="hand2",
-        width=w, padx=2, pady=0, borderwidth=0, highlightthickness=0,
-        activebackground=GRN, activeforeground=TX1)
-    b.pack(side="left", padx=4)
-    hover(b, BG4, BRD2, fg, TX1)
-    return b
 
-shuf_btn = mkbtn(ctrl_row, "🔀", toggle_shuffle, 12, TX3)
-mkbtn(ctrl_row, "⏮", play_prev, 14)
-play_btn = mkbtn(ctrl_row, "▶", toggle_play, 18, BG, 3)
-play_btn.config(bg=GRN, activebackground=GRN2)
-hover(play_btn, GRN, GRN2, BG, BG)
-mkbtn(ctrl_row, "⏭", play_next, 14)
-rep_btn = mkbtn(ctrl_row, "🔁", toggle_repeat, 12, TX3)
-mkbtn(ctrl_row, "⏹", stop_playback, 12, TX3)
+class ToolTip:
+    def __init__(self, widget, text):
+        self.widget = widget
+        self.text = text
+        self.tipwindow = None
+        self.id = None
+        self.widget.bind("<Enter>", self.enter, add="+")
+        self.widget.bind("<Leave>", self.leave, add="+")
+        self.widget.bind("<Button-1>", self.leave, add="+")
 
-# Time labels
-time_row = tki.Frame(ctrl_frame, bg=BG2)
-time_row.pack(pady=(4, 0))
-lbl_cur = tki.Label(time_row, text="0:00", font=FTM, bg=BG2, fg=TX2)
-lbl_cur.pack(side="left")
-tki.Label(time_row, text="  /  ", font=FT, bg=BG2, fg=TX3).pack(side="left")
-lbl_tot = tki.Label(time_row, text="0:00", font=FTM, bg=BG2, fg=TX3)
-lbl_tot.pack(side="left")
+    def enter(self, event=None):
+        self.schedule()
 
-# Right: volume
-vol_frame = tki.Frame(btm_inner, bg=BG2, width=170)
+    def leave(self, event=None):
+        self.unschedule()
+        self.hidetip()
+
+    def schedule(self):
+        self.unschedule()
+        self.id = self.widget.after(500, self.showtip)
+
+    def unschedule(self):
+        if self.id:
+            self.widget.after_cancel(self.id)
+            self.id = None
+
+    def showtip(self, event=None):
+        text_val = self.text() if callable(self.text) else self.text
+        x = self.widget.winfo_rootx() + 20
+        y = self.widget.winfo_rooty() - 30
+        self.tipwindow = tw = tki.Toplevel(self.widget)
+        tw.wm_overrideredirect(True)
+        tw.wm_geometry(f"+{x}+{y}")
+        tw.attributes("-topmost", True)
+        lbl = tki.Label(tw, text=text_val, justify=tki.LEFT,
+                      bg=BG4, fg=TX1, relief=tki.SOLID, borderwidth=1,
+                      font=FT)
+        lbl.pack(ipadx=5, ipady=2)
+
+    def hidetip(self):
+        tw = self.tipwindow
+        self.tipwindow = None
+        if tw:
+            tw.destroy()
+
+class IconButton:
+    """A canvas-based icon button with no border."""
+    def __init__(self, parent, text="", command=None, size=44, font_size=14,
+                 fg=TX1, bg=BG2, hover_fg=GRN2, font_fam="Segoe MDL2 Assets", font_weight="normal", tooltip=None):
+        self._fg = fg
+        self._hover_fg = hover_fg
+        self._command = command
+        self.canvas = tki.Canvas(parent, width=size, height=size,
+            bg=bg, highlightthickness=0, bd=0, cursor="hand2")
+        font_tuple = (font_fam, font_size, font_weight) if font_weight != "normal" else (font_fam, font_size)
+        self._text_id = self.canvas.create_text(
+            size // 2, size // 2, text=text, font=font_tuple, fill=fg)
+        self.canvas.bind("<Enter>", lambda e: self.canvas.itemconfig(self._text_id, fill=self._hover_fg))
+        self.canvas.bind("<Leave>", lambda e: self.canvas.itemconfig(self._text_id, fill=self._fg))
+        self.canvas.bind("<Button-1>", lambda e: self._command() if self._command else None)
+        if tooltip:
+            ToolTip(self.canvas, tooltip)
+
+    def pack(self, **kw): self.canvas.pack(**kw)
+    def config(self, **kw):
+        if "text" in kw: self.canvas.itemconfig(self._text_id, text=kw.pop("text"))
+        if "fg" in kw:
+            self._fg = kw.pop("fg")
+            self.canvas.itemconfig(self._text_id, fill=self._fg)
+
+shuf_btn = IconButton(ctrl_row, "\uE8B1", toggle_shuffle, size=38, font_size=14, fg=TX3, tooltip="Shuffle")
+shuf_btn.pack(side="left", padx=8)
+
+prev_btn = IconButton(ctrl_row, "\uE892", play_prev, size=42, font_size=16, tooltip="Previous")
+prev_btn.pack(side="left", padx=8)
+
+play_btn = IconButton(ctrl_row, "\uE768", toggle_play, size=52, font_size=20, fg="#ffffff", tooltip=lambda: "Pause" if st.playing else "Play")
+play_btn.pack(side="left", padx=8)
+
+next_btn = IconButton(ctrl_row, "\uE893", play_next, size=42, font_size=16, tooltip="Next")
+next_btn.pack(side="left", padx=8)
+
+rep_btn = IconButton(ctrl_row, "\uE8EE", toggle_repeat, size=38, font_size=14, fg=TX3, tooltip="Repeat")
+rep_btn.pack(side="left", padx=8)
+
+# Right: volume (vertically centered, green seeker)
+vol_frame = tki.Frame(btm_inner, bg=BG2, width=210)
 vol_frame.pack(side="right", fill="y", pady=12)
 vol_frame.pack_propagate(False)
 
 vol_row = tki.Frame(vol_frame, bg=BG2)
-vol_row.pack(fill="x")
+vol_row.pack(fill="x", expand=True, anchor="center")
+
+class QueueIcon(tki.Canvas):
+    def __init__(self, parent, command=None, size=28, bg=BG2, fg=TX3, hover_fg=GRN2, active_fg=GRN, tooltip=None):
+        super().__init__(parent, width=size, height=size, bg=bg, highlightthickness=0, bd=0, cursor="hand2")
+        self.size = size
+        self.fg = fg
+        self.hover_fg = hover_fg
+        self.active_fg = active_fg
+        self.command = command
+        self._is_active = False
+
+        self.bind("<Enter>", self._on_enter)
+        self.bind("<Leave>", self._on_leave)
+        self.bind("<Button-1>", self._on_click)
+        if tooltip:
+            ToolTip(self, tooltip)
+        self._draw(self.fg)
+
+    def set_active(self, active):
+        self._is_active = active
+        self._draw(self.active_fg if active else self.fg)
+
+    def _on_enter(self, e):
+        self._draw(self.active_fg if self._is_active else self.hover_fg)
+
+    def _on_leave(self, e):
+        self._draw(self.active_fg if self._is_active else self.fg)
+
+    def _on_click(self, e):
+        if self.command:
+            self.command()
+
+    def _draw(self, color):
+        self.delete("all")
+        cx, cy = self.size / 2, self.size / 2
+        
+        # Dimensions
+        w = 14  # Full width of the icon
+        hw = w / 2
+        line_width = 3 # Thickness of the lines
+        
+        # 1. Top Pill/Rectangle
+        # We use a very thick line with round caps to create a "pill" shape easily
+        self.create_line(
+            cx - hw, cy - 6, 
+            cx + hw, cy - 6, 
+            fill=color, width=line_width, capstyle="round"
+        )
+        
+        # 2. Middle Line
+        self.create_line(
+            cx - hw, cy, 
+            cx + hw, cy, 
+            fill=color, width=line_width, capstyle="round"
+        )
+        
+        # 3. Bottom Line
+        self.create_line(
+            cx - hw, cy + 6, 
+            cx + hw, cy + 6, 
+            fill=color, width=line_width, capstyle="round"
+        )
+
+def toggle_queue_panel(e=None):
+    if q_panel.winfo_manager():
+        q_sash.pack_forget()
+        q_panel.pack_forget()
+        q_icon.set_active(False)
+    else:
+        # Repack slightly out of order to ensure exact original layout (q_panel then browse)
+        if 'browse' in globals():
+            browse.pack_forget()
+        q_panel.pack(side="right", fill="y", padx=(0, 10), pady=10)
+        q_sash.pack(side="right", fill="y", pady=10)
+        if 'browse' in globals():
+            browse.pack(side="left", fill="both", expand=True, padx=(10, 8), pady=10)
+        q_icon.set_active(True)
+
+q_icon = QueueIcon(vol_row, command=toggle_queue_panel, size=28, bg=BG2, fg=TX3, hover_fg=GRN2, active_fg=GRN, tooltip="Queue")
+q_icon.pack(side="left", padx=(0, 10))
+q_icon.set_active(True)
 
 v_icon = tki.Label(vol_row, text="🔊", font=("Segoe UI", 12),
-    bg=BG2, fg=TX2, cursor="hand2")
+    bg=BG2, fg=GRN, cursor="hand2")
 v_icon.pack(side="left")
 v_icon.bind("<Button-1>", lambda e: toggle_mute())
+ToolTip(v_icon, lambda: "Unmute" if st.volume == 0 else "Mute")
 
-vol_sl = tki.Scale(vol_row, from_=0, to=100, orient=tki.HORIZONTAL,
-    command=set_vol, bg=BG2, fg=GRN, troughcolor=PGB,
-    activebackground=GRN2, highlightthickness=0, borderwidth=0,
-    sliderrelief=tki.FLAT, length=80, sliderlength=12, showvalue=False)
+class VolumeSeeker:
+    def __init__(self, parent, command=None, width=80, height=6, bg=PGB, fg=GRN, active_fg=GRN2):
+        self._command = command
+        self._val = 0
+        self._width = width
+        self._height = height
+        self._bg = bg
+        self._fg = fg
+        self._active_fg = active_fg
+        
+        self.canvas = tki.Canvas(parent, width=width, height=height, bg=bg,
+            highlightthickness=0, bd=0, cursor="hand2")
+        self.canvas.bind("<Button-1>", self._on_mouse)
+        self.canvas.bind("<B1-Motion>", self._on_mouse)
+        
+    def _on_mouse(self, ev):
+        pct = max(0.0, min(1.0, ev.x / self._width))
+        self.set(pct * 100, do_callback=True)
+        
+    def set(self, val, do_callback=False):
+        self._val = max(0.0, min(100.0, float(val)))
+        self._draw()
+        if do_callback and self._command:
+            self._command(self._val)
+            
+    def get(self):
+        return self._val
+        
+    def _draw(self):
+        self.canvas.delete("all")
+        self.canvas.create_rectangle(0, 0, self._width, self._height, fill=self._bg, outline="")
+        fw = (self._val / 100.0) * self._width
+        if fw > 0:
+            self.canvas.create_rectangle(0, 0, fw, self._height, fill=self._fg, outline="")
+            if fw > 4:
+                cy = self._height / 2
+                self.canvas.create_oval(fw-5, cy-5, fw+5, cy+5, fill=self._active_fg, outline="")
+                
+    def pack(self, **kw):
+        self.canvas.pack(**kw)
+
+vol_sl = VolumeSeeker(vol_row, command=set_vol, width=80, height=6, bg=PGB, fg=GRN, active_fg=GRN2)
 vol_sl.set(70)
 vol_sl.pack(side="left", padx=(6, 6))
 
-v_pct = tki.Label(vol_row, text="70%", font=FT, bg=BG2, fg=TX3)
+v_pct = tki.Label(vol_row, text="70%", font=FT, bg=BG2, fg=GRN)
 v_pct.pack(side="left")
 
 # ═══════════════════════════════════════════════════════════════════
@@ -477,55 +1183,74 @@ main.pack(fill="both", expand=True)
 
 # ── QUEUE PANEL (right) ──────────────────────────────────────────
 q_panel = tki.Frame(main, bg=BG, width=280)
+q_sash = tki.Frame(main, bg=BG, width=4, cursor="sb_h_double_arrow")
 q_panel.pack(side="right", fill="y", padx=(0, 10), pady=10)
 q_panel.pack_propagate(False)
+q_sash.pack(side="right", fill="y", pady=10)
+
+def resize_q_panel(ev):
+    w = q_panel.winfo_width() - ev.x
+    w = max(200, min(800, w))
+    q_panel.config(width=w)
+
+q_sash.bind("<B1-Motion>", resize_q_panel)
+q_sash.bind("<Enter>", lambda e: q_sash.config(bg=TX3))
+q_sash.bind("<Leave>", lambda e: q_sash.config(bg=BG))
 
 q_outer, q_card = card(q_panel)
 q_outer.pack(fill="both", expand=True)
 
 q_hdr = tki.Frame(q_card, bg=BG4)
 q_hdr.pack(fill="x")
-tki.Label(q_hdr, text="  ♪  PLAY QUEUE", font=FH, bg=BG4, fg=GRN).pack(side="left", pady=8, padx=6)
-q_count = tki.Label(q_hdr, text="0", font=FT, bg=BG4, fg=TX3)
-q_count.pack(side="right", padx=8)
+tki.Label(q_hdr, text=" Queue", font=FH, bg=BG4, fg=GRN).pack(side="left", pady=8, padx=6)
+q_close = tki.Label(q_hdr, text="✕", font=("Segoe UI", 12), bg=BG4, fg=TX3, cursor="hand2")
+q_close.pack(side="right", padx=8)
+q_close.bind("<Enter>", lambda e: q_close.config(fg=RED))
+q_close.bind("<Leave>", lambda e: q_close.config(fg=TX3))
+q_close.bind("<Button-1>", toggle_queue_panel)
+ToolTip(q_close, "Hide Queue")
 
 # Queue action buttons
 q_btn_row = tki.Frame(q_card, bg=BG3, padx=6, pady=4)
 q_btn_row.pack(fill="x")
 
-def add_all_local():
-    for i in range(len(st.local_files)):
-        add_local_to_queue(i)
-tki.Button(q_btn_row, text="+ All Local", command=add_all_local,
-    bg=BG4, fg=TX2, font=FT, padx=6, pady=1, relief=tki.FLAT,
-    cursor="hand2", borderwidth=0, highlightthickness=0).pack(side="left", padx=2)
-
-tki.Button(q_btn_row, text="Clear", command=clear_queue,
+tki.Button(q_btn_row, text="Clear All", command=clear_queue,
     bg=BG4, fg=RED, font=FT, padx=6, pady=1, relief=tki.FLAT,
     cursor="hand2", borderwidth=0, highlightthickness=0).pack(side="right", padx=2)
 
 def remove_selected():
-    sel = q_list.curselection()
-    if sel: remove_from_queue(int(sel[0]))
-tki.Button(q_btn_row, text="Remove", command=remove_selected,
-    bg=BG4, fg=TX3, font=FT, padx=6, pady=1, relief=tki.FLAT,
-    cursor="hand2", borderwidth=0, highlightthickness=0).pack(side="right", padx=2)
+    pass # No longer driven by Listbox selection, "X" buttons on rows handle this
 
-# Queue listbox
+# Queue scrolled frame
 q_lf = tki.Frame(q_card, bg=BG3)
 q_lf.pack(fill="both", expand=True, padx=4, pady=4)
 
-q_sb = tki.Scrollbar(q_lf, bg=BG4, troughcolor=BG3,
-    highlightthickness=0, borderwidth=0)
-q_sb.pack(side="right", fill="y")
+q_sb = ModernScrollbar(q_lf, bg=BG3, fg=TX3, active_fg=TX1, width=8)
+q_sb.pack(side="right", fill="y", pady=2)
 
-q_list = tki.Listbox(q_lf, bg=BG3, fg=TX1, font=FL, relief=tki.FLAT,
-    borderwidth=0, selectbackground=GRN_BG, selectforeground=GRN,
-    highlightthickness=0, activestyle="none", yscrollcommand=q_sb.set)
-q_list.pack(fill="both", expand=True)
-q_sb.config(command=q_list.yview)
-q_list.bind("<Double-Button-1>", lambda e: (
-    play_from_queue(int(q_list.curselection()[0])) if q_list.curselection() else None))
+q_canvas = tki.Canvas(q_lf, bg=BG3, highlightthickness=0, bd=0)
+q_canvas.pack(side="left", fill="both", expand=True)
+
+q_sb.command = q_canvas.yview
+q_canvas.configure(yscrollcommand=q_sb.set)
+
+q_frame = tki.Frame(q_canvas, bg=BG3)
+q_canvas_win = q_canvas.create_window((0, 0), window=q_frame, anchor="nw")
+
+def _on_q_frame_configure(e):
+    q_canvas.configure(scrollregion=q_canvas.bbox("all"))
+q_frame.bind("<Configure>", _on_q_frame_configure)
+
+def _on_q_canvas_configure(e):
+    q_canvas.itemconfig(q_canvas_win, width=e.width)
+q_canvas.bind("<Configure>", _on_q_canvas_configure)
+
+def _on_q_mousewheel(e):
+    if q_panel.winfo_manager():
+        q_canvas.yview_scroll(int(-1*(e.delta/120)), "units")
+        
+q_canvas.bind("<Enter>", lambda e: root.bind_all("<MouseWheel>", _on_q_mousewheel))
+q_canvas.bind("<Leave>", lambda e: root.unbind_all("<MouseWheel>"))
 
 # ── BROWSE PANEL (left) ──────────────────────────────────────────
 browse = tki.Frame(main, bg=BG)
@@ -603,15 +1328,14 @@ tki.Label(loc_help, text="Double-click to add to queue",
 loc_lf = tki.Frame(loc_card, bg=BG3)
 loc_lf.pack(fill="both", expand=True, padx=4, pady=4)
 
-loc_sb = tki.Scrollbar(loc_lf, bg=BG4, troughcolor=BG3,
-    highlightthickness=0, borderwidth=0)
-loc_sb.pack(side="right", fill="y")
+loc_sb = ModernScrollbar(loc_lf, bg=BG3, fg=TX3, active_fg=TX1, width=8)
+loc_sb.pack(side="right", fill="y", pady=2)
 
 local_list = tki.Listbox(loc_lf, bg=BG3, fg=TX1, font=FL, relief=tki.FLAT,
     borderwidth=0, selectbackground=GRN_BG, selectforeground=GRN,
     highlightthickness=0, activestyle="none", yscrollcommand=loc_sb.set)
 local_list.pack(fill="both", expand=True)
-loc_sb.config(command=local_list.yview)
+loc_sb.command = local_list.yview
 
 def on_local_dblclick(ev):
     sel = local_list.curselection()
@@ -631,26 +1355,35 @@ spot_fonts = {"FONT_HEADER": FH, "FONT_SMALL": FS, "FONT_TINY": FT, "FONT_LISTBO
 spotify_tab.build_spotify_browse(spotify_frame, spot_colors, spot_fonts, root, add_spotify_to_queue)
 
 # ═══════════════════════════════════════════════════════════════════
-#  MENU BAR
+#  MENU BAR (Updated to minimize borders)
 # ═══════════════════════════════════════════════════════════════════
-menubar = tki.Menu(root, bg=BG2, fg=TX1, activebackground=GRN,
-    activeforeground=TX1, relief=tki.FLAT, borderwidth=0)
-root.config(menu=menubar)
 
-fmenu = tki.Menu(menubar, tearoff=0, bg=BG2, fg=TX1,
-    activebackground=GRN, activeforeground=TX1)
-menubar.add_cascade(label=" ♫ File ", menu=fmenu)
-fmenu.add_command(label="  Add Files...", command=add_files)
+# File Button
+btn_file = tki.Menubutton(custom_menubar, text=" File ", bg="#212121", fg=TX1,
+    activebackground=GRAY, activeforeground=TX1, relief=tki.FLAT, 
+    borderwidth=0, cursor="hand2", highlightthickness=0)
+btn_file.pack(side="left", padx=4, pady=2)
+
+# Updated fmenu
+fmenu = tki.Menu(btn_file, tearoff=0)  
+fmenu.add_command(label="Add Files...", command=add_files)
 fmenu.add_separator()
-fmenu.add_command(label="  Exit", command=root.destroy)
+fmenu.add_command(label="Exit", command=root.destroy)
+btn_file.config(menu=fmenu)
 
-hmenu = tki.Menu(menubar, tearoff=0, bg=BG2, fg=TX1,
-    activebackground=GRN, activeforeground=TX1)
-menubar.add_cascade(label=" Help ", menu=hmenu)
-hmenu.add_command(label="  About", command=lambda: tkinter.messagebox.showinfo(
+# Help Button
+btn_help = tki.Menubutton(custom_menubar, text=" Help ", bg="#212121", fg=TX1,
+    activebackground=GRAY, activeforeground=TX1, relief=tki.FLAT, 
+    borderwidth=0, cursor="hand2", highlightthickness=0)
+btn_help.pack(side="left", padx=4, pady=2)
+
+# Updated hmenu
+hmenu = tki.Menu(btn_help, tearoff=0)
+hmenu.add_command(label="About", command=lambda: tkinter.messagebox.showinfo(
     "About PiPlayer",
     "PiPlayer v3.0\n\nLocal + Spotify Music Player\n"
     "Global queue with mixed playback.\n\nOriginally created in 2020."))
+btn_help.config(menu=hmenu)
 
 # ═══════════════════════════════════════════════════════════════════
 #  KEYBOARD
@@ -670,6 +1403,7 @@ load_local_tracks()
 set_vol(70)
 
 def on_close():
+    _stop_spotify()
     pygame.mixer.music.stop()
     pygame.mixer.quit()
     root.destroy()

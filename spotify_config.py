@@ -1,5 +1,13 @@
+import os
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
+
 # Spotify API Configuration
-SPOTIFY_CLIENT_ID = "be6f70e018d1419b9efa6a46f64e0ea7"
-SPOTIFY_CLIENT_SECRET = "0805ba7fc53149caa934dd190f88c989"
-SPOTIFY_REDIRECT_URI = "http://127.0.0.1:8888/callback"
-SPOTIFY_SCOPE = "user-read-playback-state user-modify-playback-state user-read-currently-playing playlist-read-private playlist-read-collaborative user-library-read"
+SPOTIFY_CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID")
+SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET")
+SPOTIFY_REDIRECT_URI = os.getenv("SPOTIFY_REDIRECT_URI")
+SPOTIFY_SCOPE = os.getenv("SPOTIFY_SCOPE")
+SPOTIFY_BEARER_TOKEN = os.getenv("SPOTIFY_BEARER_TOKEN", "")
+

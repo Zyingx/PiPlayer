@@ -1,6 +1,6 @@
 # PiPlayer v3.0
 
-A modern, high-performance music player built with Python and Tkinter, featuring a unified playback engine for both local files and Spotify integration.
+A modern, high-performance music player built with Python and Tkinter, featuring an all-in-one playback engine that seamlessly handles local files, Spotify, and more.
 
 ![PiPlayer Interface](https://raw.githubusercontent.com/Zyingx/Basic-Music-Player/main/Logo%20%26%20Stuff/screenshot_placeholder.png)
 

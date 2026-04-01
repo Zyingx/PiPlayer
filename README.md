@@ -1,4 +1,4 @@
-# PiPlayer v3.0
+# PiPlayer v0.1
 
 A modern, high-performance music player built with Python and Tkinter, featuring an all-in-one playback engine that seamlessly handles local files, Spotify, and more.
 

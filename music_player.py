@@ -1,7 +1,7 @@
-"""PiPlayer v3.0 — Music Player with Global Queue"""
+"""PiPlayer v0.0.1 — Music Player with Global Queue"""
 
 import tkinter as tki
-from tkinter import ttk, filedialog
+from tkinter import filedialog
 import tkinter.messagebox
 import os, random, time, threading
 import pygame
@@ -19,6 +19,13 @@ except ImportError:
     PIL_AVAILABLE = False
     print("[WARN] Pillow not installed. Album art disabled. Run: pip install Pillow")
 
+try:
+    import fitz  # PyMuPDF
+    PYMUPDF_AVAILABLE = True
+except ImportError:
+    PYMUPDF_AVAILABLE = False
+    print("[WARN] PyMuPDF not installed. SVG icons disabled. Run: pip install PyMuPDF")
+
 def set_dark_titlebar(window):
     try:
         window.update()
@@ -33,9 +40,19 @@ def set_dark_titlebar(window):
 
 pygame.mixer.init(frequency=44100, size=-16, channels=2, buffer=2048)
 
+
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MUSIC_DIR = os.path.join(BASE_DIR, "Music")
 ICON_PATH = os.path.join(BASE_DIR, "Logo & Stuff", "PiPlayer.ico")
+
+# Tell Windows to use the custom icon for the taskbar / apps menu 
+# instead of the default Python generic icon.
+try:
+    if os.name == 'nt':
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(u'company.piplayer.musicplayer.1_0')
+except Exception:
+    pass
 
 # ── Colors ────────────────────────────────────────────────────────
 BG      = "#000000"
@@ -56,7 +73,40 @@ PGB     = "#12121e"
 RED     = "#ff4757"
 GRAY    = "#a6a6a6"
 
+# Spotify green accents
+SP_GRN    = "#1DB954"
+SP_GRN2   = "#1ed760"
+SP_GRN_BG = "#0c2e1a"
+
+# YouTube red accents
+YT_RED    = "#FF0000"
+YT_RED2   = "#ff4444"
+YT_RED_BG = "#2e0c0c"
+
 player_icons = {}
+
+def _load_tab_icon(filename, size=18):
+    """Load an icon (PNG or SVG) from the Logo & Stuff folder and resize it."""
+    if not PIL_AVAILABLE:
+        return None
+    try:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Logo & Stuff", filename)
+        if filename.lower().endswith('.svg'):
+            if not PYMUPDF_AVAILABLE:
+                print(f"[WARN] Cannot load SVG icon {filename}: PyMuPDF not installed")
+                return None
+            doc = fitz.open(path)
+            pix = doc[0].get_pixmap(alpha=True)
+            img = Image.frombytes("RGBA", [pix.width, pix.height], pix.samples)
+            img = img.resize((size, size), Image.LANCZOS)
+            doc.close()
+        else:
+            img = Image.open(path).convert('RGBA')
+            img = img.resize((size, size), Image.LANCZOS)
+        return ImageTk.PhotoImage(img)
+    except Exception as e:
+        print(f"[WARN] Could not load icon {filename}: {e}")
+        return None
 
 # ── Fonts ─────────────────────────────────────────────────────────
 FH = ("Segoe UI", 10, "bold")
@@ -273,6 +323,49 @@ class ScrollingLabel:
             self._place_text()
 
 
+class EllipsisLabel(tki.Label):
+    """A Label that truncates its text with '...' when it overflows."""
+    def __init__(self, parent, full_text="", **kwargs):
+        super().__init__(parent, **kwargs)
+        self._full_text = full_text
+        self.config(text=full_text)
+        self.bind("<Configure>", self._on_resize)
+
+    def set_text(self, text):
+        self._full_text = text
+        self._truncate()
+
+    def _on_resize(self, event=None):
+        self.after(1, self._truncate)
+
+    def _truncate(self):
+        import tkinter.font as tkfont
+        try:
+            w = self.winfo_width()
+            if w <= 1:
+                return
+            font_info = self.cget("font")
+            font = tkfont.Font(font=font_info)
+            text = self._full_text
+            text_w = font.measure(text)
+            if text_w <= w:
+                self.config(text=text)
+                return
+            ellipsis = "..."
+            ew = font.measure(ellipsis)
+            # Binary search for max chars that fit
+            lo, hi = 0, len(text)
+            while lo < hi:
+                mid = (lo + hi + 1) // 2
+                if font.measure(text[:mid]) + ew <= w:
+                    lo = mid
+                else:
+                    hi = mid - 1
+            self.config(text=text[:lo] + ellipsis if lo < len(text) else text)
+        except Exception:
+            pass
+
+
 # Global scroll synchroniser (created once, wired to root later)
 _np_sync = None  # initialised after root is created
 
@@ -305,7 +398,7 @@ class ModernScrollbar(tki.Canvas):
         fraction = event.y / h
         if self.command:
             try: self.command("moveto", fraction)
-            except: pass
+            except Exception: pass
             
     def on_click(self, event):
         self.on_drag(event)
@@ -315,17 +408,40 @@ def fmt_time(s):
     return f"{int(s//60)}:{int(s%60):02d}"
 
 def get_dur(fp):
+    # 1. Try mutagen (handles most formats)
     try:
         a = MutagenFile(fp)
-        if a and a.info: return a.info.length
-    except: pass
+        if a and a.info and a.info.length > 0:
+            return a.info.length
+    except Exception:
+        pass
+    # 2. Fallback for WAV: read header directly
+    if fp.lower().endswith(".wav"):
+        try:
+            import wave
+            with wave.open(fp, 'rb') as wf:
+                frames = wf.getnframes()
+                rate = wf.getframerate()
+                if rate > 0:
+                    return frames / rate
+        except Exception:
+            pass
+    # 3. Last resort: pygame.mixer.Sound (loads into memory, but works)
+    try:
+        snd = pygame.mixer.Sound(fp)
+        length = snd.get_length()
+        del snd
+        if length > 0:
+            return length
+    except Exception:
+        pass
     return 0
 
 def parse_name(fn):
     return os.path.splitext(fn)[0].replace("_", " ")
 
 def scan_music():
-    exts = (".mp3", ".wav", ".ogg", ".flac", ".aac", ".m4a", ".wma")
+    exts = (".mp3", ".wav", ".ogg", ".flac")
     if not os.path.isdir(MUSIC_DIR): return []
     return [os.path.join(MUSIC_DIR, f) for f in sorted(os.listdir(MUSIC_DIR))
             if os.path.splitext(f)[1].lower() in exts]
@@ -463,7 +579,7 @@ def _stop_local():
     """Stop pygame local playback."""
     try:
         pygame.mixer.music.stop()
-    except:
+    except Exception:
         pass
 
 def play_from_queue(idx):
@@ -517,8 +633,42 @@ def _play_spotify(item):
         sp = spotify_tab.sp
         devices = sp.devices()
         if not devices['devices']:
-            tkinter.messagebox.showwarning("No Device", "Open Spotify app first.")
+            # No devices found — try launching Spotify in a background thread
+            # to avoid freezing the UI during the wait
+            def _launch_and_wait():
+                _try_launch_spotify_app()
+                # Poll for devices for up to ~10 seconds
+                found_devices = None
+                for _ in range(5):
+                    time.sleep(2)
+                    try:
+                        result = sp.devices()
+                        if result['devices']:
+                            found_devices = result
+                            break
+                    except Exception:
+                        pass
+                # Back to main thread
+                def _after_wait():
+                    if found_devices and found_devices['devices']:
+                        _start_spotify_playback(item, found_devices)
+                    else:
+                        tkinter.messagebox.showwarning(
+                            "No Device",
+                            "Could not find a Spotify device.\n"
+                            "Please open the Spotify app and try again."
+                        )
+                root.after(0, _after_wait)
+            threading.Thread(target=_launch_and_wait, daemon=True).start()
             return
+        _start_spotify_playback(item, devices)
+    except Exception as e:
+        tkinter.messagebox.showerror("Playback Error", str(e))
+
+def _start_spotify_playback(item, devices):
+    """Start Spotify playback on the first available/active device."""
+    try:
+        sp = spotify_tab.sp
         active = None
         for d in devices['devices']:
             if d['is_active']: active = d['id']; break
@@ -531,9 +681,51 @@ def _play_spotify(item):
         st._t0 = time.time()
         st._off = 0
         st.elapsed = 0
+        render_queue()
+        update_now_playing_ui()
+        _update_btn()
         _start_tick()
     except Exception as e:
         tkinter.messagebox.showerror("Playback Error", str(e))
+
+def _try_launch_spotify_app():
+    """Attempt to launch the Spotify desktop app on Windows."""
+    import subprocess
+    import shutil
+
+    # Try the Windows Spotify URI scheme first (works for both Store and desktop installs)
+    try:
+        os.startfile("spotify:")
+        print("[DEBUG] Launched Spotify via URI scheme")
+        return
+    except Exception as e:
+        print(f"[DEBUG] URI scheme launch failed: {e}")
+
+    # Try common install locations
+    spotify_paths = [
+        os.path.join(os.environ.get("APPDATA", ""), "Spotify", "Spotify.exe"),
+        os.path.join(os.environ.get("LOCALAPPDATA", ""), "Microsoft", "WindowsApps", "Spotify.exe"),
+    ]
+    for path in spotify_paths:
+        if os.path.isfile(path):
+            try:
+                subprocess.Popen([path], shell=False)
+                print(f"[DEBUG] Launched Spotify from: {path}")
+                return
+            except Exception as e:
+                print(f"[DEBUG] Failed to launch {path}: {e}")
+
+    # Fallback: try the system PATH
+    spotify_exe = shutil.which("spotify") or shutil.which("Spotify")
+    if spotify_exe:
+        try:
+            subprocess.Popen([spotify_exe], shell=False)
+            print(f"[DEBUG] Launched Spotify from PATH: {spotify_exe}")
+            return
+        except Exception as e:
+            print(f"[DEBUG] Failed to launch from PATH: {e}")
+
+    print("[DEBUG] Could not find Spotify app to launch")
 
 def toggle_play():
     if st.qi == -1:
@@ -548,7 +740,8 @@ def toggle_play():
                 if spotify_tab.sp: spotify_tab.sp.start_playback()
             except Exception as e:
                 print(f"[DEBUG] Resume Spotify: {e}")
-        st.paused = False; st.playing = True
+        st.paused = False
+        st.playing = True
         st._t0 = time.time()
         _start_tick()
     elif st.playing:
@@ -559,7 +752,8 @@ def toggle_play():
                 if spotify_tab.sp: spotify_tab.sp.pause_playback()
             except Exception as e:
                 print(f"[DEBUG] Pause Spotify: {e}")
-        st.paused = True; st.playing = False
+        st.paused = True
+        st.playing = False
         st._off = st.elapsed
     else:
         play_from_queue(st.qi)
@@ -568,8 +762,10 @@ def toggle_play():
 def stop_playback():
     _stop_local()
     _stop_spotify()
-    st.playing = False; st.paused = False
-    st.elapsed = 0; st._off = 0
+    st.playing = False
+    st.paused = False
+    st.elapsed = 0
+    st._off = 0
     _update_btn()
     _draw_progress(0, st.duration)
     lbl_cur.config(text="0:00")
@@ -644,7 +840,7 @@ def seek(ev):
             pygame.mixer.music.play(start=pos)
             pygame.mixer.music.set_volume(st.volume)
             st._t0 = time.time(); st._off = pos; st.elapsed = pos
-        except: pass
+        except Exception: pass
     elif cur_src == "spotify" and spotify_tab.sp:
         pos_ms = int(pos * 1000)
         st._t0 = time.time(); st._off = pos; st.elapsed = pos
@@ -772,37 +968,47 @@ def render_queue():
         
         fn_to_use = ("Segoe UI", 10, "bold") if i == st.qi else ("Segoe UI", 10)
         col_to_use = GRN if i == st.qi else TX1
-        title_lbl = tki.Label(text_f, text=item['title'], font=fn_to_use, fg=col_to_use, bg=BG3, anchor="w")
+        title_lbl = EllipsisLabel(text_f, full_text=item['title'], font=fn_to_use, fg=col_to_use, bg=BG3, anchor="w")
         title_lbl.pack(fill="x", anchor="w")
         
-        artist_lbl = tki.Label(text_f, text=item['artist'], font=FS, fg=TX3, bg=BG3, anchor="w")
+        artist_lbl = EllipsisLabel(text_f, full_text=item['artist'], font=FS, fg=TX3, bg=BG3, anchor="w")
         artist_lbl.pack(fill="x", anchor="w")
         
-        def _set_hover(state):
-            bg_col = BG4 if state else BG3
-            for w in (row, num_lbl, art_lbl, x_btn, text_f, title_lbl, artist_lbl):
-                try: w.config(bg=bg_col)
-                except: pass
-                
-        def on_enter(e):
-             _set_hover(True)
-        def on_leave(e):
-             _set_hover(False)
+        # Capture widget references via default args to avoid closure-in-loop bug
+        def _make_hover_handlers(row=row, num_lbl=num_lbl, art_lbl=art_lbl,
+                                  x_btn=x_btn, text_f=text_f,
+                                  title_lbl=title_lbl, artist_lbl=artist_lbl):
+            widgets = (row, num_lbl, art_lbl, x_btn, text_f, title_lbl, artist_lbl)
+            def _set_hover(state):
+                bg_col = BG4 if state else BG3
+                for w in widgets:
+                    try: w.config(bg=bg_col)
+                    except: pass
+            def on_enter(e):
+                _set_hover(True)
+            def on_leave(e):
+                _set_hover(False)
+            return on_enter, on_leave
+
+        on_enter, on_leave = _make_hover_handlers()
         
         # Bind enter/leave to the row and ALL children
         for w in (row, num_lbl, art_lbl, text_f, title_lbl, artist_lbl, x_btn):
             w.bind("<Enter>", on_enter, add="+")
             w.bind("<Leave>", on_leave, add="+")
             
-        def on_x_enter(e):
-            try: x_btn.config(fg=RED)
-            except: pass
-        def on_x_leave(e):
-            try: x_btn.config(fg=TX3)
-            except: pass
-            
-        x_btn.bind("<Enter>", on_x_enter)
-        x_btn.bind("<Leave>", on_x_leave)
+        def _make_x_hover(btn=x_btn):
+            def on_x_enter(e):
+                try: btn.config(fg=RED)
+                except: pass
+            def on_x_leave(e):
+                try: btn.config(fg=TX3)
+                except: pass
+            return on_x_enter, on_x_leave
+
+        _x_enter, _x_leave = _make_x_hover()
+        x_btn.bind("<Enter>", _x_enter)
+        x_btn.bind("<Leave>", _x_leave)
         x_btn.bind("<Button-1>", lambda e, idx=i: remove_from_queue(idx))
         
         def make_player(idx):
@@ -839,20 +1045,98 @@ def render_queue():
             if PIL_AVAILABLE:
                 threading.Thread(target=_load_art, daemon=True).start()
 
-def load_local_tracks():
-    st.local_files = scan_music()
-    st.local_names = [parse_name(os.path.basename(f)) for f in st.local_files]
-    local_list.delete(0, tki.END)
-    for n in st.local_names:
-        local_list.insert(tki.END, f"  {n}")
-    local_count.config(text=f"{len(st.local_files)} tracks")
+def load_local_tracks(rescan=False):
+    if rescan or not st.local_files:
+        scanned = scan_music()
+        # Merge: keep existing files, add any new ones from the Music folder
+        existing = set(st.local_files)
+        for f in scanned:
+            if f not in existing:
+                st.local_files.append(f)
+                st.local_names.append(parse_name(os.path.basename(f)))
+    # If local_names is out of sync (shouldn't happen, but safety check)
+    if len(st.local_names) != len(st.local_files):
+        st.local_names = [parse_name(os.path.basename(f)) for f in st.local_files]
+    # Clear previous rows
+    for w in loc_inner.winfo_children():
+        w.destroy()
+    _local_active_idx[0] = -1
+    _local_active_widgets.clear()
+
+    for idx, (fp, name) in enumerate(zip(st.local_files, st.local_names)):
+        row = tki.Frame(loc_inner, bg=BG3, cursor="hand2")
+        row.pack(fill="x", pady=1)
+
+        # Track name
+        name_lbl = EllipsisLabel(row, full_text=f"  {name}", font=FL, bg=BG3, fg=TX1, anchor="w")
+        name_lbl.pack(side="left", fill="x", expand=True)
+
+        # Duration on the right
+        dur = get_dur(fp)
+        dur_text = fmt_time(dur) if dur > 0 else "—"
+        dur_lbl = tki.Label(row, text=dur_text, font=FT, bg=BG3, fg=TX3, anchor="e")
+        dur_lbl.pack(side="right", padx=(4, 10))
+
+        widgets = [row, name_lbl, dur_lbl]
+
+        # Hover effect
+        def make_hover(ws=widgets, i=idx):
+            def eh(_):
+                for x in ws:
+                    if x.winfo_exists() and _local_active_idx[0] != i:
+                        x.config(bg=GRN_BG)
+            def lh(_):
+                for x in ws:
+                    if x.winfo_exists() and _local_active_idx[0] != i:
+                        x.config(bg=BG3)
+            return eh, lh
+
+        eh, lh = make_hover()
+        for w in widgets:
+            w.bind("<Enter>", eh)
+            w.bind("<Leave>", lh)
+
+        # Double click to add to queue
+        def make_dblclick(i=idx):
+            def dblclk(e):
+                add_local_to_queue(i)
+            return dblclk
+
+        dblclk = make_dblclick(idx)
+        for w in widgets:
+            w.bind("<Double-Button-1>", dblclk)
+
+        # Right-click context menu
+        def make_rclick(i=idx):
+            def rclk(e):
+                menu = tki.Menu(root, tearoff=0, bg=BG4, fg=TX1, font=FS,
+                    activebackground=GRN_BG, activeforeground=TX1,
+                    relief=tki.FLAT, bd=1)
+                menu.add_command(label="+ Add to Queue", command=lambda: add_local_to_queue(i))
+                menu.add_separator()
+                menu.add_command(label="✕ Remove from List", command=lambda: _remove_local_track(i))
+                menu.tk_popup(e.x_root, e.y_root)
+            return rclk
+
+        rclk = make_rclick(idx)
+        for w in widgets:
+            w.bind("<Button-3>", rclk)
+
+    local_count.config(text=f"{len(st.local_files)}")
+
+def _remove_local_track(idx):
+    """Remove a track from the local list by index."""
+    if 0 <= idx < len(st.local_files):
+        st.local_files.pop(idx)
+        st.local_names.pop(idx)
+        load_local_tracks()
 
 # ═══════════════════════════════════════════════════════════════════
 #  WINDOW
 # ═══════════════════════════════════════════════════════════════════
 root = tki.Tk()
 set_dark_titlebar(root)
-root.title("PiPlayer v3.0")
+root.title("PiPlayer v0.0.1")
 try: root.iconbitmap(ICON_PATH)
 except: pass
 root.geometry("960x620")
@@ -1170,8 +1454,8 @@ hdr.pack_propagate(False)
 
 hdr_in = tki.Frame(hdr, bg=BG2)
 hdr_in.pack(fill="x", padx=18)
-tki.Label(hdr_in, text="🎧  PiPlayer", font=FLG, bg=BG2, fg=TX1).pack(side="left", pady=8)
-tki.Label(hdr_in, text="v3.0", font=FT, bg=GRN_BG, fg=GRN, padx=8, pady=2).pack(side="right", pady=12)
+tki.Label(hdr_in, text="  PiPlayer", font=FLG, bg=BG2, fg=TX1).pack(side="left", pady=8)
+tki.Label(hdr_in, text="v0.0.1", font=FT, bg=GRN_BG, fg=GRN, padx=8, pady=2).pack(side="right", pady=12)
 
 tki.Frame(root, bg=BRD, height=1).pack(side="top", fill="x")
 
@@ -1218,8 +1502,7 @@ tki.Button(q_btn_row, text="Clear All", command=clear_queue,
     bg=BG4, fg=RED, font=FT, padx=6, pady=1, relief=tki.FLAT,
     cursor="hand2", borderwidth=0, highlightthickness=0).pack(side="right", padx=2)
 
-def remove_selected():
-    pass # No longer driven by Listbox selection, "X" buttons on rows handle this
+
 
 # Queue scrolled frame
 q_lf = tki.Frame(q_card, bg=BG3)
@@ -1247,6 +1530,9 @@ q_canvas.bind("<Configure>", _on_q_canvas_configure)
 
 def _on_q_mousewheel(e):
     if q_panel.winfo_manager():
+        top, bottom = q_canvas.yview()
+        if (e.delta > 0 and top <= 0) or (e.delta < 0 and bottom >= 1):
+            return
         q_canvas.yview_scroll(int(-1*(e.delta/120)), "units")
         
 q_canvas.bind("<Enter>", lambda e: root.bind_all("<MouseWheel>", _on_q_mousewheel))
@@ -1263,19 +1549,28 @@ tab_bar.pack(fill="x", pady=(0, 8))
 cur_tab = tki.StringVar(value="local")
 local_frame = tki.Frame(browse, bg=BG)
 spotify_frame = tki.Frame(browse, bg=BG)
+youtube_frame = tki.Frame(browse, bg=BG)
 
 def switch_tab(name):
     cur_tab.set(name)
+    # Hide all frames first
+    local_frame.pack_forget()
+    spotify_frame.pack_forget()
+    youtube_frame.pack_forget()
+    # Reset all tab buttons
+    t_local.config(bg=BG2, fg=TX3)
+    t_spot.config(bg=BG2, fg=TX3)
+    t_yt.config(bg=BG2, fg=TX3)
+    # Show selected
     if name == "local":
-        spotify_frame.pack_forget()
         local_frame.pack(fill="both", expand=True)
         t_local.config(bg=GRN_BG, fg=GRN)
-        t_spot.config(bg=BG2, fg=TX3)
-    else:
-        local_frame.pack_forget()
+    elif name == "spotify":
         spotify_frame.pack(fill="both", expand=True)
-        t_local.config(bg=BG2, fg=TX3)
-        t_spot.config(bg=GRN_BG, fg=GRN)
+        t_spot.config(bg=SP_GRN_BG, fg=SP_GRN)
+    elif name == "youtube":
+        youtube_frame.pack(fill="both", expand=True)
+        t_yt.config(bg=YT_RED_BG, fg=YT_RED)
 
 t_local = tki.Button(tab_bar, text="🎵 Local Music",
     command=lambda: switch_tab("local"),
@@ -1284,12 +1579,28 @@ t_local = tki.Button(tab_bar, text="🎵 Local Music",
     borderwidth=0, highlightthickness=0)
 t_local.pack(side="left", padx=(0, 4))
 
-t_spot = tki.Button(tab_bar, text="🎧 Spotify",
+t_spot = tki.Button(tab_bar, text=" Spotify",
     command=lambda: switch_tab("spotify"),
     bg=BG2, fg=TX3, font=("Segoe UI", 10, "bold"),
     relief=tki.FLAT, cursor="hand2", padx=14, pady=5,
     borderwidth=0, highlightthickness=0)
-t_spot.pack(side="left")
+t_spot.pack(side="left", padx=(0, 4))
+
+t_yt = tki.Button(tab_bar, text=" YouTube",
+    command=lambda: switch_tab("youtube"),
+    bg=BG2, fg=TX3, font=("Segoe UI", 10, "bold"),
+    relief=tki.FLAT, cursor="hand2", padx=14, pady=5,
+    borderwidth=0, highlightthickness=0)
+t_yt.pack(side="left")
+
+# Apply icons to tab buttons if PIL is available
+if PIL_AVAILABLE:
+    player_icons['spotify'] = _load_tab_icon('spotify_icon.svg', 18)
+    player_icons['youtube'] = _load_tab_icon('youtube_icon.svg', 18)
+    if player_icons['spotify']:
+        t_spot.config(image=player_icons['spotify'], compound='left')
+    if player_icons['youtube']:
+        t_yt.config(image=player_icons['youtube'], compound='left')
 
 # Show local tab by default
 local_frame.pack(fill="both", expand=True)
@@ -1300,19 +1611,21 @@ loc_outer.pack(fill="both", expand=True)
 
 loc_hdr = tki.Frame(loc_card, bg=BG4)
 loc_hdr.pack(fill="x")
-tki.Label(loc_hdr, text="  🎵  LOCAL LIBRARY", font=FH,
+tki.Label(loc_hdr, text="  Tracks", font=FH,
     bg=BG4, fg=GRN).pack(side="left", pady=8, padx=6)
-local_count = tki.Label(loc_hdr, text="0 tracks", font=FT, bg=BG4, fg=TX3)
+local_count = tki.Label(loc_hdr, text="0", font=FT, bg=BG4, fg=TX3)
 local_count.pack(side="right", padx=8)
 
 def add_files():
     files = filedialog.askopenfilenames(title="Add Music Files",
-        filetypes=[("Audio", "*.mp3 *.wav *.ogg *.flac *.aac *.m4a"), ("All", "*.*")])
+        filetypes=[("Audio", "*.mp3 *.wav *.ogg *.flac"), ("All", "*.*")])
+    if not files:
+        return
     for f in files:
         if f not in st.local_files:
             st.local_files.append(f)
             st.local_names.append(parse_name(os.path.basename(f)))
-    load_local_tracks()
+    load_local_tracks()  # re-render only, does NOT overwrite st.local_files
 
 add_b = tki.Button(loc_hdr, text="+ Add", command=add_files,
     bg=BG4, fg=TX2, font=FT, padx=6, pady=1, relief=tki.FLAT,
@@ -1322,8 +1635,6 @@ add_b.pack(side="right", padx=4, pady=6)
 # Help text
 loc_help = tki.Frame(loc_card, bg=BG3, padx=10, pady=4)
 loc_help.pack(fill="x")
-tki.Label(loc_help, text="Double-click to add to queue",
-    font=FT, bg=BG3, fg=TX3).pack(anchor="w")
 
 loc_lf = tki.Frame(loc_card, bg=BG3)
 loc_lf.pack(fill="both", expand=True, padx=4, pady=4)
@@ -1331,17 +1642,37 @@ loc_lf.pack(fill="both", expand=True, padx=4, pady=4)
 loc_sb = ModernScrollbar(loc_lf, bg=BG3, fg=TX3, active_fg=TX1, width=8)
 loc_sb.pack(side="right", fill="y", pady=2)
 
-local_list = tki.Listbox(loc_lf, bg=BG3, fg=TX1, font=FL, relief=tki.FLAT,
-    borderwidth=0, selectbackground=GRN_BG, selectforeground=GRN,
-    highlightthickness=0, activestyle="none", yscrollcommand=loc_sb.set)
-local_list.pack(fill="both", expand=True)
-loc_sb.command = local_list.yview
+loc_canvas = tki.Canvas(loc_lf, bg=BG3, highlightthickness=0, bd=0)
+loc_canvas.pack(side="left", fill="both", expand=True)
+loc_sb.command = loc_canvas.yview
+loc_canvas.configure(yscrollcommand=loc_sb.set)
 
-def on_local_dblclick(ev):
-    sel = local_list.curselection()
-    if sel:
-        add_local_to_queue(int(sel[0]))
-local_list.bind("<Double-Button-1>", on_local_dblclick)
+loc_inner = tki.Frame(loc_canvas, bg=BG3)
+loc_inner_id = loc_canvas.create_window((0, 0), window=loc_inner, anchor="nw")
+
+def _loc_canvas_config(e):
+    loc_canvas.itemconfig(loc_inner_id, width=e.width)
+loc_canvas.bind("<Configure>", _loc_canvas_config)
+loc_inner.bind("<Configure>", lambda e: loc_canvas.configure(scrollregion=loc_canvas.bbox("all")))
+
+def _on_loc_mousewheel(event):
+    top, bottom = loc_canvas.yview()
+    if (event.delta > 0 and top <= 0) or (event.delta < 0 and bottom >= 1):
+        return
+    loc_canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+loc_canvas.bind("<Enter>", lambda e: root.bind_all("<MouseWheel>", _on_loc_mousewheel))
+loc_canvas.bind("<Leave>", lambda e: root.unbind_all("<MouseWheel>"))
+
+# Active selection state for local tracks
+_local_active_idx = [-1]
+_local_active_widgets = []
+
+# Keep a dummy local_list reference for backwards compatibility with load_local_tracks
+class _LocalListCompat:
+    """Thin shim so load_local_tracks() can still call delete/insert."""
+    def delete(self, *a): pass
+    def insert(self, *a): pass
+local_list = _LocalListCompat()
 
 # ── SPOTIFY TAB ───────────────────────────────────────────────────
 spot_colors = {
@@ -1353,6 +1684,24 @@ spot_colors = {
 spot_fonts = {"FONT_HEADER": FH, "FONT_SMALL": FS, "FONT_TINY": FT, "FONT_LISTBOX": FL,
     "FONT_TITLE": FN, "FONT_ARTIST": FA, "FONT_TIME": FTM}
 spotify_tab.build_spotify_browse(spotify_frame, spot_colors, spot_fonts, root, add_spotify_to_queue)
+
+# ── YOUTUBE TAB (Coming Soon) ─────────────────────────────────────
+yt_outer, yt_card = card(youtube_frame)
+yt_outer.pack(fill="both", expand=True)
+
+yt_hdr = tki.Frame(yt_card, bg=BG4)
+yt_hdr.pack(fill="x")
+tki.Label(yt_hdr, text="  ▶  YouTube", font=FH,
+    bg=BG4, fg=YT_RED).pack(side="left", pady=8, padx=6)
+
+yt_body = tki.Frame(yt_card, bg=BG3)
+yt_body.pack(fill="both", expand=True)
+
+yt_coming = tki.Label(yt_body, text="Coming Soon",
+    font=("Segoe UI", 28, "bold"), bg=BG3, fg=YT_RED)
+yt_coming.place(relx=0.5, rely=0.45, anchor="center")
+
+
 
 # ═══════════════════════════════════════════════════════════════════
 #  MENU BAR (Updated to minimize borders)
@@ -1381,7 +1730,7 @@ btn_help.pack(side="left", padx=4, pady=2)
 hmenu = tki.Menu(btn_help, tearoff=0)
 hmenu.add_command(label="About", command=lambda: tkinter.messagebox.showinfo(
     "About PiPlayer",
-    "PiPlayer v3.0\n\nLocal + Spotify Music Player\n"
+    "PiPlayer v0.0.1\n\nLocal + Spotify Music Player\n"
     "Global queue with mixed playback.\n\nOriginally created in 2020."))
 btn_help.config(menu=hmenu)
 
@@ -1406,6 +1755,7 @@ def on_close():
     _stop_spotify()
     pygame.mixer.music.stop()
     pygame.mixer.quit()
+
     root.destroy()
 root.protocol("WM_DELETE_WINDOW", on_close)
 

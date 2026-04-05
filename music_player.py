@@ -470,7 +470,7 @@ def _get_local_album_art(filepath):
         # MP3 (ID3 tags)
         if hasattr(audio, 'tags') and audio.tags:
             for key in audio.tags:
-                if key.startswith('APIC') or key == 'APIC:':
+                if isinstance(key, str) and (key.startswith('APIC') or key == 'APIC:'):
                     data = audio.tags[key].data
                     return Image.open(io.BytesIO(data))
         # FLAC
@@ -1021,6 +1021,100 @@ def render_queue():
             
         for w in (row, num_lbl, art_lbl, text_f, title_lbl, artist_lbl):
             w.bind("<Double-Button-1>", make_player(i))
+
+        # Drag and Drop for reordering
+        def _make_drag_handlers(idx=i, r_widget=row):
+            drag_state = {"dragging": False, "start_y": 0}
+            
+            def on_press(e):
+                drag_state["dragging"] = False
+                drag_state["start_y"] = e.y_root
+            
+            def on_drag_motion(e):
+                if abs(e.y_root - drag_state["start_y"]) > 5:
+                    drag_state["dragging"] = True
+                    r_widget.config(cursor="fleur")
+                    
+                if drag_state["dragging"]:
+                    y_in_q = q_frame.winfo_pointery() - q_frame.winfo_rooty()
+                    try:
+                        y_in_q += q_canvas.canvasy(0)
+                    except:
+                        pass
+                        
+                    children = [c for c in q_frame.winfo_children() if c != getattr(q_frame, "drag_indicator", None)]
+                    new_idx = 0
+                    for child in children:
+                        cy = child.winfo_y()
+                        ch = child.winfo_height()
+                        if y_in_q > cy + ch / 2:
+                            new_idx += 1
+                            
+                    if not hasattr(q_frame, "drag_indicator") or not q_frame.drag_indicator.winfo_exists():
+                        q_frame.drag_indicator = tki.Frame(q_frame, bg=GRN, height=2)
+                        
+                    if new_idx == 0:
+                        indicator_y = children[0].winfo_y() - 1 if children else 0
+                    elif new_idx >= len(children):
+                        indicator_y = children[-1].winfo_y() + children[-1].winfo_height() + 1 if children else 0
+                    else:
+                        indicator_y = children[new_idx].winfo_y() - 1
+                        
+                    q_frame.drag_indicator.place(x=0, y=indicator_y, width=q_frame.winfo_width())
+                    q_frame.drag_indicator.lift()
+                
+            def on_drag_release(e):
+                r_widget.config(cursor="")
+                if hasattr(q_frame, "drag_indicator") and q_frame.drag_indicator.winfo_exists():
+                    q_frame.drag_indicator.place_forget()
+                    
+                if not drag_state["dragging"]:
+                    return
+                    
+                drag_state["dragging"] = False
+                
+                # Calculate new index based on mouse position
+                y_in_q = q_frame.winfo_pointery() - q_frame.winfo_rooty()
+                # Also account for scrolling (canvas y view)
+                try:
+                    canvas_y_offset = q_canvas.canvasy(0)
+                    y_in_q += canvas_y_offset
+                except:
+                    pass
+                    
+                children = [c for c in q_frame.winfo_children() if c != getattr(q_frame, "drag_indicator", None)]
+                new_idx = 0
+                for child in children:
+                    cy = child.winfo_y()
+                    ch = child.winfo_height()
+                    if y_in_q > cy + ch / 2:
+                        new_idx += 1
+                
+                new_idx = min(new_idx, len(st.queue))
+                new_idx = max(new_idx, 0)
+                
+                if idx < new_idx:
+                    new_idx -= 1
+                
+                if new_idx != idx:
+                    itm = st.queue.pop(idx)
+                    st.queue.insert(new_idx, itm)
+                    
+                    if st.qi == idx:
+                        st.qi = new_idx
+                    elif idx < st.qi <= new_idx:
+                        st.qi -= 1
+                    elif new_idx <= st.qi < idx:
+                        st.qi += 1
+                    render_queue()
+                    
+            return on_press, on_drag_motion, on_drag_release
+            
+        on_press, on_drag_motion, on_drag_release = _make_drag_handlers(i, row)
+        for w in (row, num_lbl, art_lbl, text_f, title_lbl, artist_lbl):
+            w.bind("<ButtonPress-1>", on_press, add="+")
+            w.bind("<B1-Motion>", on_drag_motion, add="+")
+            w.bind("<ButtonRelease-1>", on_drag_release, add="+")
             
         icon = "🎵" if item["source"] == "local" else "🎧"
         if 'q_img' in item:
